@@ -8,7 +8,7 @@ from psycopg2.extras import RealDictCursor
 app = Flask(__name__)
 
 # Database URL van Render (zet dit in Environment Variables)
-DATABASE_URL = os.environ.get('postgresql://zuntiydb_user:TTCE0lvvTT2YQ2XMhFt4Yuy1OpA8vKat@dpg-d6otdn75gffc738pho5g-a/zuntiydb')
+DATABASE_URL = os.environ.get('https://dashboard.render.com/d/dpg-d6otdn75gffc738pho5g-a/info')
 
 def get_db_connection():
     """Maakt verbinding met PostgreSQL"""
