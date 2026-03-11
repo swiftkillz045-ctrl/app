@@ -1,56 +1,54 @@
 from flask import Flask, request, jsonify
 import uuid
-import json
 import os
 from datetime import datetime, timedelta
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 app = Flask(__name__)
 
-# Gebruik /tmp voor Render.com (werkt altijd)
-# OF gebruik in-memory als bestanden niet werken
-USE_MEMORY = True  # Zet op False als je wel bestanden wilt proberen
+# Database URL van Render (zet dit in Environment Variables)
+DATABASE_URL = os.environ.get('DATABASE_URL')
 
-# In-memory storage (werkt altijd)
-memory_db = {}
+def get_db_connection():
+    """Maakt verbinding met PostgreSQL"""
+    conn = psycopg2.connect(DATABASE_URL)
+    return conn
 
-def get_db():
-    if USE_MEMORY:
-        return memory_db
-    # Anders probeer bestand
-    DB_FILE = "/tmp/keys.json"
-    if os.path.exists(DB_FILE):
-        with open(DB_FILE, 'r') as f:
-            return json.load(f)
-    return {}
-
-def save_db(data):
-    if USE_MEMORY:
-        global memory_db
-        memory_db = data
-        return
-    # Anders sla op in bestand
-    DB_FILE = "/tmp/keys.json"
-    try:
-        with open(DB_FILE, 'w') as f:
-            json.dump(data, f, indent=2)
-    except:
-        pass  # Als het niet lukt, gebruik alleen memory
-
-def create_key_folder(key, name, key_type):
-    """Maakt key info (alleen in memory op Render)"""
-    if key_type == "1m":
-        expires = datetime.now() + timedelta(days=30)
-    elif key_type == "3m":
-        expires = datetime.now() + timedelta(days=90)
-    else:  # lifetime
-        expires = "never"
+def init_db():
+    """Maakt de tabel aan als die niet bestaat"""
+    conn = get_db_connection()
+    cur = conn.cursor()
     
-    # Sla alleen op in database, geen mapjes op Render (geen permanente opslag)
-    return expires
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS licenses (
+            key VARCHAR(20) PRIMARY KEY,
+            name VARCHAR(100) NOT NULL,
+            type VARCHAR(10) NOT NULL,
+            expires VARCHAR(50),
+            created TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            active BOOLEAN DEFAULT TRUE,
+            uses INTEGER DEFAULT 0
+        )
+    ''')
+    
+    conn.commit()
+    cur.close()
+    conn.close()
 
 @app.route('/')
 def home():
-    return "Auth Server Running! Keys in memory: " + str(len(get_db()))
+    """Check of database werkt"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute('SELECT COUNT(*) FROM licenses')
+        count = cur.fetchone()[0]
+        cur.close()
+        conn.close()
+        return f"Auth Server Running! Totaal keys: {count}"
+    except Exception as e:
+        return f"Server running, DB error: {str(e)}"
 
 # Admin: Maak nieuwe key
 @app.route('/create', methods=['POST'])
@@ -70,25 +68,34 @@ def create_key():
         key = '-'.join([uuid.uuid4().hex[:4].upper() for _ in range(4)])
         
         # Bepaal vervaldatum
-        expires = create_key_folder(key, name, key_type)
+        if key_type == "1m":
+            expires = datetime.now() + timedelta(days=30)
+            expires_str = expires.isoformat()
+        elif key_type == "3m":
+            expires = datetime.now() + timedelta(days=90)
+            expires_str = expires.isoformat()
+        else:  # lifetime
+            expires_str = "never"
         
         # Sla op in database
-        keys = get_db()
-        keys[key] = {
-            "name": name,
-            "type": key_type,
-            "expires": str(expires),
-            "created": str(datetime.now()),
-            "active": True,
-            "uses": 0
-        }
-        save_db(keys)
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        cur.execute('''
+            INSERT INTO licenses (key, name, type, expires, active, uses)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        ''', (key, name, key_type, expires_str, True, 0))
+        
+        conn.commit()
+        cur.close()
+        conn.close()
         
         return jsonify({
             "success": True,
             "key": key,
             "type": key_type,
-            "expires": str(expires)
+            "expires": expires_str,
+            "message": "Key opgeslagen in database"
         })
         
     except Exception as e:
@@ -107,38 +114,57 @@ def validate_key():
         if not key:
             return jsonify({"valid": False, "error": "No key provided"}), 400
         
-        keys = get_db()
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
         
-        if key in keys and keys[key].get("active", False):
-            expires = keys[key]["expires"]
-            
-            # Check lifetime
-            if expires == "never":
-                keys[key]["uses"] = keys[key].get("uses", 0) + 1
-                save_db(keys)
+        cur.execute('SELECT * FROM licenses WHERE key = %s', (key,))
+        license_data = cur.fetchone()
+        
+        if not license_data:
+            cur.close()
+            conn.close()
+            return jsonify({"valid": False, "reason": "not_found"})
+        
+        if not license_data['active']:
+            cur.close()
+            conn.close()
+            return jsonify({"valid": False, "reason": "inactive"})
+        
+        expires = license_data['expires']
+        
+        # Check lifetime
+        if expires == "never":
+            cur.execute('UPDATE licenses SET uses = uses + 1 WHERE key = %s', (key,))
+            conn.commit()
+            cur.close()
+            conn.close()
+            return jsonify({
+                "valid": True, 
+                "expires": "Lifetime", 
+                "name": license_data['name']
+            })
+        
+        # Check vervaldatum
+        try:
+            expire_date = datetime.fromisoformat(expires)
+            if datetime.now() < expire_date:
+                cur.execute('UPDATE licenses SET uses = uses + 1 WHERE key = %s', (key,))
+                conn.commit()
+                cur.close()
+                conn.close()
                 return jsonify({
                     "valid": True, 
-                    "expires": "Lifetime", 
-                    "name": keys[key]["name"]
+                    "expires": expires, 
+                    "name": license_data['name']
                 })
-            
-            # Check vervaldatum
-            try:
-                expire_date = datetime.fromisoformat(expires)
-                if datetime.now() < expire_date:
-                    keys[key]["uses"] = keys[key].get("uses", 0) + 1
-                    save_db(keys)
-                    return jsonify({
-                        "valid": True, 
-                        "expires": expires, 
-                        "name": keys[key]["name"]
-                    })
-                else:
-                    return jsonify({"valid": False, "reason": "expired"})
-            except:
-                return jsonify({"valid": False, "reason": "date_error"})
-        
-        return jsonify({"valid": False, "reason": "not_found"})
+            else:
+                cur.close()
+                conn.close()
+                return jsonify({"valid": False, "reason": "expired"})
+        except Exception as e:
+            cur.close()
+            conn.close()
+            return jsonify({"valid": False, "reason": "date_error", "error": str(e)})
         
     except Exception as e:
         return jsonify({"valid": False, "error": str(e)}), 500
@@ -146,17 +172,74 @@ def validate_key():
 # Admin: Lijst van alle keys
 @app.route('/list')
 def list_keys():
-    return jsonify(get_db())
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        cur.execute('SELECT * FROM licenses ORDER BY created DESC')
+        keys = cur.fetchall()
+        
+        cur.close()
+        conn.close()
+        
+        return jsonify([dict(row) for row in keys])
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # Admin: Verwijder key
 @app.route('/delete/<key>', methods=['DELETE'])
 def delete_key(key):
-    keys = get_db()
-    if key in keys:
-        del keys[key]
-        save_db(keys)
-        return jsonify({"success": True})
-    return jsonify({"success": False, "error": "Key not found"})
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        cur.execute('DELETE FROM licenses WHERE key = %s', (key,))
+        
+        if cur.rowcount == 0:
+            cur.close()
+            conn.close()
+            return jsonify({"success": False, "error": "Key not found"})
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        return jsonify({"success": True, "message": f"Key {key} verwijderd"})
+        
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+# Admin: Deactiveer key (in plaats van verwijderen)
+@app.route('/deactivate/<key>', methods=['POST'])
+def deactivate_key(key):
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        cur.execute('UPDATE licenses SET active = FALSE WHERE key = %s', (key,))
+        
+        if cur.rowcount == 0:
+            cur.close()
+            conn.close()
+            return jsonify({"success": False, "error": "Key not found"})
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        return jsonify({"success": True, "message": f"Key {key} gedeactiveerd"})
+        
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+# Start database bij opstarten
+with app.app_context():
+    try:
+        init_db()
+        print("Database geinitialiseerd!")
+    except Exception as e:
+        print(f"Database fout: {e}")
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
