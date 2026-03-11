@@ -6,25 +6,38 @@ from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
-# Bestand waar keys worden opgeslagen (Render heeft permanente opslag)
-DB_FILE = "/data/keys.json"
+# Gebruik /tmp voor Render.com (werkt altijd)
+# OF gebruik in-memory als bestanden niet werken
+USE_MEMORY = True  # Zet op False als je wel bestanden wilt proberen
 
-def load_keys():
+# In-memory storage (werkt altijd)
+memory_db = {}
+
+def get_db():
+    if USE_MEMORY:
+        return memory_db
+    # Anders probeer bestand
+    DB_FILE = "/tmp/keys.json"
     if os.path.exists(DB_FILE):
         with open(DB_FILE, 'r') as f:
             return json.load(f)
     return {}
 
-def save_keys(keys):
-    with open(DB_FILE, 'w') as f:
-        json.dump(keys, f, indent=2)
+def save_db(data):
+    if USE_MEMORY:
+        global memory_db
+        memory_db = data
+        return
+    # Anders sla op in bestand
+    DB_FILE = "/tmp/keys.json"
+    try:
+        with open(DB_FILE, 'w') as f:
+            json.dump(data, f, indent=2)
+    except:
+        pass  # Als het niet lukt, gebruik alleen memory
 
 def create_key_folder(key, name, key_type):
-    """Maakt mapje aan met key bestand"""
-    folder_path = f"/data/klanten/{name}_{key[:8]}"
-    os.makedirs(folder_path, exist_ok=True)
-    
-    # Bepaal vervaldatum
+    """Maakt key info (alleen in memory op Render)"""
     if key_type == "1m":
         expires = datetime.now() + timedelta(days=30)
     elif key_type == "3m":
@@ -32,101 +45,118 @@ def create_key_folder(key, name, key_type):
     else:  # lifetime
         expires = "never"
     
-    # Sla key info op
-    with open(f"{folder_path}/key_info.txt", 'w') as f:
-        f.write(f"Naam: {name}\n")
-        f.write(f"Key: {key}\n")
-        f.write(f"Type: {key_type}\n")
-        f.write(f"Geldig tot: {expires}\n")
-        f.write(f"Aangemaakt: {datetime.now()}\n")
-    
+    # Sla alleen op in database, geen mapjes op Render (geen permanente opslag)
     return expires
 
 @app.route('/')
 def home():
-    return "Auth Server Running!"
+    return "Auth Server Running! Keys in memory: " + str(len(get_db()))
 
 # Admin: Maak nieuwe key
 @app.route('/create', methods=['POST'])
 def create_key():
-    data = request.json
-    name = data.get("name")
-    key_type = data.get("type", "1m")  # 1m, 3m, lifetime
-    
-    # Genereer unieke key (bijv: X7K9-M2P5-L8Q3-R4T6)
-    key = '-'.join([uuid.uuid4().hex[:4].upper() for _ in range(4)])
-    
-    # Maakt mapje aan op server
-    expires = create_key_folder(key, name, key_type)
-    
-    # Sla op in database
-    keys = load_keys()
-    keys[key] = {
-        "name": name,
-        "type": key_type,
-        "expires": str(expires),
-        "created": str(datetime.now()),
-        "active": True,
-        "uses": 0
-    }
-    save_keys(keys)
-    
-    return jsonify({
-        "success": True,
-        "key": key,
-        "type": key_type,
-        "expires": str(expires),
-        "folder": f"klanten/{name}_{key[:8]}"
-    })
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"success": False, "error": "No JSON data"}), 400
+            
+        name = data.get("name")
+        key_type = data.get("type", "1m")
+        
+        if not name:
+            return jsonify({"success": False, "error": "Name required"}), 400
+        
+        # Genereer unieke key
+        key = '-'.join([uuid.uuid4().hex[:4].upper() for _ in range(4)])
+        
+        # Bepaal vervaldatum
+        expires = create_key_folder(key, name, key_type)
+        
+        # Sla op in database
+        keys = get_db()
+        keys[key] = {
+            "name": name,
+            "type": key_type,
+            "expires": str(expires),
+            "created": str(datetime.now()),
+            "active": True,
+            "uses": 0
+        }
+        save_db(keys)
+        
+        return jsonify({
+            "success": True,
+            "key": key,
+            "type": key_type,
+            "expires": str(expires)
+        })
+        
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 # Client: Check of key geldig is
 @app.route('/validate', methods=['POST'])
 def validate_key():
-    data = request.json
-    key = data.get("key")
-    
-    keys = load_keys()
-    
-    if key in keys and keys[key]["active"]:
-        expires = keys[key]["expires"]
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"valid": False, "error": "No data"}), 400
+            
+        key = data.get("key")
         
-        # Check lifetime
-        if expires == "never":
-            keys[key]["uses"] += 1
-            save_keys(keys)
-            return jsonify({"valid": True, "expires": "Lifetime", "name": keys[key]["name"]})
+        if not key:
+            return jsonify({"valid": False, "error": "No key provided"}), 400
         
-        # Check vervaldatum
-        try:
-            expire_date = datetime.fromisoformat(expires)
-            if datetime.now() < expire_date:
-                keys[key]["uses"] += 1
-                save_keys(keys)
-                return jsonify({"valid": True, "expires": expires, "name": keys[key]["name"]})
-            else:
-                return jsonify({"valid": False, "reason": "expired"})
-        except:
-            return jsonify({"valid": False})
-    
-    return jsonify({"valid": False, "reason": "not_found"})
+        keys = get_db()
+        
+        if key in keys and keys[key].get("active", False):
+            expires = keys[key]["expires"]
+            
+            # Check lifetime
+            if expires == "never":
+                keys[key]["uses"] = keys[key].get("uses", 0) + 1
+                save_db(keys)
+                return jsonify({
+                    "valid": True, 
+                    "expires": "Lifetime", 
+                    "name": keys[key]["name"]
+                })
+            
+            # Check vervaldatum
+            try:
+                expire_date = datetime.fromisoformat(expires)
+                if datetime.now() < expire_date:
+                    keys[key]["uses"] = keys[key].get("uses", 0) + 1
+                    save_db(keys)
+                    return jsonify({
+                        "valid": True, 
+                        "expires": expires, 
+                        "name": keys[key]["name"]
+                    })
+                else:
+                    return jsonify({"valid": False, "reason": "expired"})
+            except:
+                return jsonify({"valid": False, "reason": "date_error"})
+        
+        return jsonify({"valid": False, "reason": "not_found"})
+        
+    except Exception as e:
+        return jsonify({"valid": False, "error": str(e)}), 500
 
 # Admin: Lijst van alle keys
 @app.route('/list')
 def list_keys():
-    keys = load_keys()
-    return jsonify(keys)
+    return jsonify(get_db())
 
 # Admin: Verwijder key
 @app.route('/delete/<key>', methods=['DELETE'])
 def delete_key(key):
-    keys = load_keys()
+    keys = get_db()
     if key in keys:
         del keys[key]
-        save_keys(keys)
+        save_db(keys)
         return jsonify({"success": True})
     return jsonify({"success": False, "error": "Key not found"})
 
 if __name__ == '__main__':
-    # Maak data map aan als die niet bestaat
-    os.makedirs("/data/klanten", exist_ok=True)
     app.run(host='0.0.0.0', port=10000)
