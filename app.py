@@ -217,3 +217,62 @@ except Exception as e:
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
+
+import secrets
+import time
+
+# Tijdelijke tokens (in memory - verdwijnen bij server restart)
+active_tokens = {}
+
+@app.route('/get-token', methods=['POST'])
+def get_token():
+    """Geeft een tijdelijk token na validatie"""
+    data = request.get_json()
+    key = data.get("key")
+    
+    # Check of key geldig is
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM licenses WHERE key = ? AND active = 1', (key,))
+    row = cursor.fetchone()
+    conn.close()
+    
+    if not row:
+        return jsonify({"success": False}), 403
+    
+    # Maak token
+    token = secrets.token_urlsafe(32)
+    active_tokens[token] = {
+        "key": key,
+        "created": time.time(),
+        "used": False
+    }
+    
+    return jsonify({
+        "success": True,
+        "token": token,
+        "expires_in": 3600  # 1 uur
+    })
+
+@app.route('/check-token', methods=['POST'])
+def check_token():
+    """Checkt of token geldig is (wordt door mod pack gebruikt)"""
+    data = request.get_json()
+    token = data.get("token")
+    
+    if token not in active_tokens:
+        return jsonify({"valid": False})
+    
+    token_data = active_tokens[token]
+    
+    # Check of niet verlopen (1 uur)
+    if time.time() - token_data["created"] > 3600:
+        del active_tokens[token]
+        return jsonify({"valid": False, "reason": "expired"})
+    
+    # Markeer als gebruikt (kan maar 1x)
+    if token_data["used"]:
+        return jsonify({"valid": False, "reason": "already_used"})
+    
+    token_data["used"] = True
+    return jsonify({"valid": True, "key": token_data["key"]})
